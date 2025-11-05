@@ -1,0 +1,4 @@
+Nama kucing saya adalah Oyen.
+Oyen suka makan ikan sarden.
+Proyek RAG lokal saya dibuat pada bulan November 2025.
+Warna favorit saya adalah biru langit
