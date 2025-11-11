@@ -1,7 +1,12 @@
 # app.py
+import os
+import time
+import json
+import urllib.request
+
 import streamlit as st
 import chromadb
-import time
+
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.embeddings.ollama import OllamaEmbedding
@@ -21,8 +26,17 @@ st.set_page_config(
 # =========================
 # GLOBAL SETTINGS (LLM & EMBEDDING)
 # =========================
+# Target LLM via Ollama (untuk menjawab)
 Settings.llm = Ollama(model="qwen3:8b", request_timeout=300.0)
-Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
+
+# Embeddings: coba Ollama; jika gagal, fallback ke FastEmbed lokal
+_USE_FALLBACK_EMBED = False
+try:
+    Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
+except Exception:
+    from llama_index.embeddings.fastembed import FastEmbedEmbedding
+    Settings.embed_model = FastEmbedEmbedding(model_name="BAAI/bge-m3")
+    _USE_FALLBACK_EMBED = True
 
 # =========================
 # UTIL: ambil debug log lintas-versi
@@ -75,7 +89,7 @@ def load_index_from_db():
         st.error(
             "Gagal memuat pipeline RAG:\n\n"
             f"{e}\n\n"
-            "Pastikan Anda sudah menjalankan skrip indexing (mis. index.py) dan folder './chroma_db' beserta "
+            "Pastikan Anda sudah menjalankan skrip indexing (mis. index.py) dan folder './chroma_db' serta "
             "koleksi 'rag_lokal_collection' tersedia."
         )
         st.stop()
@@ -107,7 +121,7 @@ def _render_sources(sources):
             score = getattr(src, "score", None)
             skor_str = f"{score:.2f}" if isinstance(score, (int, float)) else "N/A"
 
-            # Ambil isi teks lintas-versi
+            # Isi teks lintas-versi
             text = None
             try:
                 text = getattr(src, "text", None)
@@ -118,7 +132,7 @@ def _render_sources(sources):
             except Exception:
                 text = None
 
-            # Ambil metadata lintas-versi
+            # Metadata lintas-versi
             metadata = {}
             try:
                 metadata = getattr(src, "metadata", None) or getattr(getattr(src, "node", None), "metadata", {}) or {}
@@ -137,11 +151,10 @@ def _render_sources(sources):
             )
 
 def _render_safe_think(stage, stage_title, lines):
-    """Render list 'reasoning trace' yang aman dibagikan (tanpa context manager)."""
+    """Render 'reasoning trace' yang aman (tanpa context manager)."""
     stage.markdown(f"**{stage_title}**")
     for line in lines:
         stage.write(f"- {line}")
-
 
 # =========================
 # ANTARMUKA
@@ -149,11 +162,30 @@ def _render_safe_think(stage, stage_title, lines):
 st.title("💬 Chat RAG Lokal Anda")
 st.caption(f"Didukung oleh Ollama `{Settings.llm.model}` dan dokumen lokal Anda.")
 
+# Banner status embeddings/LLM
+if _USE_FALLBACK_EMBED:
+    st.warning(
+        "Embeddings memakai **fallback lokal FastEmbed (BAAI/bge-m3)** karena Ollama embedding tidak tersedia. "
+        "Retrieval tetap berjalan, tetapi hasil dapat sedikit berbeda dari `nomic-embed-text`."
+    )
+
+# Cek status daemon Ollama untuk LLM (endpoint ringan)
+_ollama_ok = True
+try:
+    with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2) as resp:
+        json.loads(resp.read().decode("utf-8"))
+except Exception:
+    _ollama_ok = False
+
+if not _ollama_ok:
+    st.info("LLM Ollama belum siap. Jalankan `ollama serve` dan pastikan model `qwen3:8b` sudah di-pull.")
+
+# Render riwayat pesan
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "safe_trace" in msg and msg["safe_trace"]:
-            with st.expander("Reasoning (Safe Trace)"):
+            with st.expander("🧭 Reasoning (Safe Trace)"):
                 _render_safe_think(st, "Langkah", msg["safe_trace"])
         if "sources" in msg and msg["sources"]:
             _render_sources(msg["sources"])
@@ -171,22 +203,18 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # ========== SAFE THINK (ditampilkan lebih dulu) ==========
-    # Handler & callback untuk jejak proses
+    # ===== SAFE THINK (ditampilkan dulu) =====
     local_debug_handler = LlamaDebugHandler(print_trace_on_end=False)
     local_callback_manager = CallbackManager([local_debug_handler])
     old_cb = getattr(Settings, "callback_manager", None)
-    Settings.callback_manager = local_callback_manager
+    Settings.callback_manager = local_callback_manager  # aktifkan tracing sementara
 
-    # 1) Mulai stopwatch
+    safe_trace_lines = []
     t0 = time.time()
 
-    # 2) Lakukan RETRIEVAL TERLEBIH DULU (sebagai "think" yang aman)
-    #    Kita tampilkan file, skor, dan preview SEBELUM jawaban di-stream.
-    safe_trace_lines = []
-    safe_block = st.container()
+    # Lakukan retrieval (top-k) sebagai "think" aman
     with st.chat_message("assistant"):
-        trace_placeholder = st.empty()  # tempat untuk menaruh panel "Reasoning (Safe Trace)"
+        trace_placeholder = st.empty()
         with st.spinner("Menganalisis pertanyaan & mengambil konteks..."):
             try:
                 retriever = index.as_retriever(similarity_top_k=5)
@@ -195,7 +223,6 @@ if prompt:
                 retrieved_nodes = []
                 safe_trace_lines.append(f"Gagal melakukan retrieval: {e}")
 
-        # Rangkai panel safe trace (tanpa membuka isi prompt/response internal model)
         elapsed_retrieve = time.time() - t0
         if retrieved_nodes:
             safe_trace_lines.append(f"Menemukan {len(retrieved_nodes)} konteks teratas (top-k).")
@@ -207,61 +234,65 @@ if prompt:
                 safe_trace_lines.append(f"Konteks {i}: file=`{file_name}` | skor={skor_str}")
         else:
             safe_trace_lines.append("Tidak ada konteks yang ditemukan atau retrieval gagal.")
-
         safe_trace_lines.append(f"Waktu retrieval: {elapsed_retrieve:.2f}s")
-        # Render “Reasoning (Safe Trace)” SEBELUM streaming jawaban
+
+        # Tampilkan Reasoning (Safe Trace) sebelum jawaban
         with trace_placeholder.container():
             st.markdown("### 🧭 Reasoning (Safe Trace)")
             _render_safe_think(st, "Langkah", safe_trace_lines)
 
-    # ========== STREAMING JAWABAN ==========
-    with st.chat_message("assistant"):
-        response_placeholder = st.empty()
-        full_response = ""
+    # ===== STREAMING JAWABAN =====
+    if not _ollama_ok:
+        # Jika LLM belum siap, tampilkan info dan simpan trace
+        with st.chat_message("assistant"):
+            st.error("LLM Ollama belum aktif. Jalankan `ollama serve` dan `ollama pull qwen3:8b`, lalu kirim pertanyaan lagi.")
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "LLM belum aktif. Silakan jalankan Ollama lalu coba lagi.",
+            "safe_trace": safe_trace_lines
+        })
+        # Pulihkan callback manager global dan akhiri
+        Settings.callback_manager = old_cb
+    else:
+        with st.chat_message("assistant"):
+            response_placeholder = st.empty()
+            full_response = ""
 
-        # Buat chat engine TANPA mengirim callback_manager (hindari argumen ganda)
-        chat_engine = index.as_chat_engine(
-            chat_mode="context",
-            memory=st.session_state.memory,
-            streaming=True,
-        )
+            # Buat chat engine TANPA callback_manager param (hindari argumen ganda)
+            chat_engine = index.as_chat_engine(
+                chat_mode="context",
+                memory=st.session_state.memory,
+                streaming=True,
+            )
 
-        try:
-            t1 = time.time()
-            streaming_response = chat_engine.stream_chat(prompt)
+            try:
+                t1 = time.time()
+                streaming_response = chat_engine.stream_chat(prompt)
 
-            for chunk in streaming_response.response_gen:
-                full_response += chunk
-                response_placeholder.markdown(full_response + "▌")
-            response_placeholder.markdown(full_response)
+                for chunk in streaming_response.response_gen:
+                    full_response += chunk
+                    response_placeholder.markdown(full_response + "▌")
+                response_placeholder.markdown(full_response)
 
-            # Sumber & log lengkap
-            sources = getattr(streaming_response, "source_nodes", [])
-            debug_log = _extract_debug_log(local_debug_handler)
+                sources = getattr(streaming_response, "source_nodes", [])
+                debug_log = _extract_debug_log(local_debug_handler)
 
-            # Tambahkan “Reasoning (Safe Trace)” ke message history agar bisa dilihat ulang
-            assistant_message = {
-                "role": "assistant",
-                "content": full_response,
-                "sources": sources if sources else [],
-                "debug_log": debug_log,
-                "safe_trace": safe_trace_lines + [f"Waktu generasi jawaban: {time.time()-t1:.2f}s"]
-            }
-        except Exception as e:
-            st.error(f"Terjadi kesalahan saat menghasilkan jawaban: {e}")
-            assistant_message = {
-                "role": "assistant",
-                "content": "Maaf, terjadi kesalahan. Coba lagi.",
-                "safe_trace": safe_trace_lines
-            }
-        finally:
-            Settings.callback_manager = old_cb  # pulihkan
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": full_response,
+                    "sources": sources if sources else [],
+                    "debug_log": debug_log,
+                    "safe_trace": safe_trace_lines + [f"Waktu generasi jawaban: {time.time()-t1:.2f}s"]
+                })
 
-    st.session_state.messages.append(assistant_message)
+            except Exception as e:
+                st.error(f"Terjadi kesalahan saat menghasilkan jawaban: {e}")
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": "Maaf, terjadi kesalahan. Coba lagi.",
+                    "safe_trace": safe_trace_lines
+                })
 
-# =========================
-# Catatan:
-# - “Reasoning (Safe Trace)” menampilkan langkah & hasil retrieval (file, skor, waktu) SEBELUM jawaban.
-# - Tidak menampilkan chain-of-thought/prompt internal model, hanya jejak proses yang aman.
-# - Pastikan Ollama dan model tersedia, serta ./chroma_db sudah berisi koleksi.
-# =========================
+            finally:
+                # Pulihkan callback manager global
+                Settings.callback_manager = old_cb
