@@ -207,12 +207,6 @@ It serves as a foundation for building fully local, private, and efficient AI kn
 
 ---
 
-## 📄 License
-
-This project is open-source and available under the [MIT License](LICENSE).
-
----
-
 ## 👨‍💻 Author
 
 **Taqiyudin Miftah Adn**
